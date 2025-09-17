@@ -12,6 +12,7 @@ import time
 import re
 from urllib.parse import urljoin, urlparse
 import logging
+import uuid
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -27,6 +28,12 @@ class IGoldScraper:
         self.categories = []
         self.subcategories = []
         self.products = []
+        self.images = []
+        self.product_counter = 0
+        self.vendors = []
+        self.vendor_counter = 0
+        self.processed_urls = set()  # Track processed product URLs to avoid duplicates
+        
         
     def get_page(self, url, max_retries=3):
         """Get a web page with error handling and retries."""
@@ -223,6 +230,11 @@ class IGoldScraper:
 
     def scrape_individual_product(self, product_url, category_id=None, subcategory_id=None):
         """Scrape detailed product information from an individual product page."""
+        # Check if we've already processed this URL
+        if product_url in self.processed_urls:
+            logger.info(f"Skipping duplicate product URL: {product_url}")
+            return None
+            
         logger.info(f"Scraping individual product: {product_url}")
 
         response = self.get_page(product_url)
@@ -231,25 +243,36 @@ class IGoldScraper:
 
         soup = BeautifulSoup(response.content, 'html.parser')
         
+        self.product_counter += 1
         product_data = {
+                'product_id': self.product_counter,
                 'category_id': category_id or '',
-                'subcategory_id': subcategory_id or '',
+                'vendor_id': '',
                 'product_name': '',
-                'image_url_1': '',
-                'image_url_2': '',
+                'description': '',
                 'country': '',
-                'refinery': '',
                 'weight': '',
                 'purity': '',
-                'fine_gold': '',
-                'diameter_size': '',
                 'buy_price': '',
                 'sell_price': '',
-                'other_properties': '',
-                'product_url': product_url
+                'slug': '',
+                'vat': ''
             }
 
         try:
+            # Extract product URL - only slug without domain
+            from urllib.parse import urlparse
+            parsed_url = urlparse(product_url)
+            product_data['slug'] = parsed_url.path.lstrip('/')
+            
+            # Set VAT based on category
+            if category_id == '1':  # Злато
+                product_data['vat'] = 'без ддс'
+            elif category_id == '2':  # Сребро
+                product_data['vat'] = 'с ддс на маржа'
+            else:  # Останалите категории (Платина, Паладий)
+                product_data['vat'] = 'с ддс'
+            
             # Extract product name from page title or main heading
             title = soup.find('title')
             if title:
@@ -260,42 +283,159 @@ class IGoldScraper:
             if main_heading:
                 product_data['product_name'] = main_heading.get_text(strip=True)
 
+            # Extract description from class descriptionOnly - keep HTML tags
+            description_element = soup.find(class_='descriptionOnly')
+            if description_element:
+                product_data['description'] = str(description_element)
+
             # Extract all text content for analysis
             page_text = soup.get_text(strip=True)
 
-            # Extract weight
+            # Try to extract refinery/mint information from HTML structure
+            # Look for patterns like "Монетен двор: <strong>Vendor Name</strong>"
+            extracted_refinery_name = ''
+            
+            # First, try to find structured HTML patterns
+            refinery_labels = ['Монетен двор:', 'Рафинерия:', 'Refinery:', 'Mint:', 'Производител:', 'Manufacturer:']
+            
+            for label in refinery_labels:
+                # Look for the label followed by a strong tag
+                pattern = rf'{re.escape(label)}\s*<strong[^>]*>(.*?)</strong>'
+                match = re.search(pattern, str(soup), re.IGNORECASE | re.DOTALL)
+                if match:
+                    extracted_refinery_name = match.group(1).strip()
+                    # Clean up HTML entities and extra whitespace
+                    extracted_refinery_name = extracted_refinery_name.replace('&nbsp;', ' ').replace('&amp;', '&')
+                    extracted_refinery_name = ' '.join(extracted_refinery_name.split())
+                    if extracted_refinery_name:
+                        break
+            
+            # If no structured HTML found, try text patterns as fallback
+            if not extracted_refinery_name:
+                refinery_patterns = [
+                    r'Монетен двор:\s*([^<\n]+?)(?=\s*Тегло|\s*Проба|\s*Чисто|\s*Диаметър|\s*Гурт|\s*Номинал|\s*Валута|\s*Опаковка|\s*Монетата|\s*Снимките|\s*Продаваме|\s*Купуваме|\s*Година|\s*$)',  # Stop at next field
+                    r'Рафинерия:\s*([^<\n]+?)(?=\s*Тегло|\s*Проба|\s*Чисто|\s*Диаметър|\s*Гурт|\s*Номинал|\s*Валута|\s*Опаковка|\s*Монетата|\s*Снимките|\s*Продаваме|\s*Купуваме|\s*Година|\s*$)',  # Stop at next field
+                    r'Refinery:\s*([^<\n]+?)(?=\s*Weight|\s*Purity|\s*Fine|\s*Diameter|\s*Edge|\s*Nominal|\s*Currency|\s*Packaging|\s*The coin|\s*Images|\s*Sell|\s*Buy|\s*Year|\s*$)',  # Stop at next field
+                    r'Mint:\s*([^<\n]+?)(?=\s*Weight|\s*Purity|\s*Fine|\s*Diameter|\s*Edge|\s*Nominal|\s*Currency|\s*Packaging|\s*The coin|\s*Images|\s*Sell|\s*Buy|\s*Year|\s*$)',  # Stop at next field
+                    r'Производител:\s*([^<\n]+?)(?=\s*Тегло|\s*Проба|\s*Чисто|\s*Диаметър|\s*Гурт|\s*Номинал|\s*Валута|\s*Опаковка|\s*Монетата|\s*Снимките|\s*Продаваме|\s*Купуваме|\s*Година|\s*$)',  # Stop at next field
+                    r'Manufacturer:\s*([^<\n]+?)(?=\s*Weight|\s*Purity|\s*Fine|\s*Diameter|\s*Edge|\s*Nominal|\s*Currency|\s*Packaging|\s*The coin|\s*Images|\s*Sell|\s*Buy|\s*Year|\s*$)'  # Stop at next field
+                ]
+                
+                for pattern in refinery_patterns:
+                    match = re.search(pattern, page_text, re.IGNORECASE)
+                    if match:
+                        extracted_refinery_name = match.group(1).strip()
+                        # Clean up the extracted name - remove any trailing text that might have been captured
+                        if extracted_refinery_name:
+                            # Remove common trailing words/phrases
+                            extracted_refinery_name = re.sub(r'\s+(Тегло|Проба|Чисто|Диаметър|Гурт|Номинал|Валута|Опаковка|Монетата|Снимките|Продаваме|Купуваме|Година).*$', '', extracted_refinery_name)
+                            extracted_refinery_name = re.sub(r'\s+(Weight|Purity|Fine|Diameter|Edge|Nominal|Currency|Packaging|The coin|Images|Sell|Buy|Year).*$', '', extracted_refinery_name)
+                            extracted_refinery_name = extracted_refinery_name.strip()
+                            if extracted_refinery_name:
+                                break
+
+            # Extract weight - only numeric value
             weight_match = re.search(r'(\d+\.?\d*)\s*гр\.', page_text)
             if weight_match:
-                product_data['weight'] = weight_match.group(1) + ' гр.'
+                product_data['weight'] = weight_match.group(1)
 
-            # Extract prices (buy and sell) - including 0 prices
-            price_matches = re.findall(r'(\d+\.?\d*)\s*лв', page_text)
-            if len(price_matches) >= 2:
-                product_data['buy_price'] = price_matches[0] + ' лв.'
-                product_data['sell_price'] = price_matches[1] + ' лв.'
-            elif len(price_matches) == 1:
-                product_data['buy_price'] = price_matches[0] + ' лв.'
+            # Extract prices using new CSS classes - only numeric values
+            buy_price_element = soup.find('span', class_='productUpdatePriceBuy')
+            sell_price_element = soup.find('span', class_='productUpdatePriceSell')
+            
+            if buy_price_element:
+                buy_price_text = buy_price_element.get_text(strip=True)
+                # Extract only the numeric part, remove "лв." and any other text
+                buy_price_match = re.search(r'(\d+\.?\d*)', buy_price_text)
+                if buy_price_match:
+                    product_data['buy_price'] = buy_price_match.group(1)
+            
+            if sell_price_element:
+                sell_price_text = sell_price_element.get_text(strip=True)
+                # Extract only the numeric part, remove "лв." and any other text
+                sell_price_match = re.search(r'(\d+\.?\d*)', sell_price_text)
+                if sell_price_match:
+                    product_data['sell_price'] = sell_price_match.group(1)
+            
+            # Fallback to old method if new CSS classes not found
+            if not product_data['buy_price'] and not product_data['sell_price']:
+                price_matches = re.findall(r'(\d+\.?\d*)\s*лв', page_text)
+                if len(price_matches) >= 2:
+                    product_data['buy_price'] = price_matches[0]
+                    product_data['sell_price'] = price_matches[1]
+                elif len(price_matches) == 1:
+                    product_data['buy_price'] = price_matches[0]
 
             # Look for 0 prices specifically
             if '0 лв' in page_text or '0.00 лв' in page_text:
                 if not product_data['buy_price']:
-                    product_data['buy_price'] = '0 лв.'
+                    product_data['buy_price'] = '0'
                 if not product_data['sell_price']:
-                    product_data['sell_price'] = '0 лв.'
+                    product_data['sell_price'] = '0'
 
             # Extract country/refinery information
-            if 'Valcambi' in page_text:
-                product_data['refinery'] = 'Valcambi'
-                product_data['country'] = 'Швейцария'
-            elif 'Argor-Heraeus' in page_text or 'Argor Heraeus' in page_text:
-                product_data['refinery'] = 'Argor-Heraeus'
-                product_data['country'] = 'Швейцария'
-            elif 'Pamp' in page_text:
-                product_data['refinery'] = 'Pamp'
-                product_data['country'] = 'Швейцария'
-            elif 'Royal Mint' in page_text:
-                product_data['refinery'] = 'Royal Mint'
-                product_data['country'] = 'Великобритания'
+            refinery_name = ''
+            country = ''
+            
+            # First, try to use extracted refinery name from patterns
+            if extracted_refinery_name:
+                refinery_name = extracted_refinery_name
+                # Try to determine country based on refinery name
+                if 'Banco de México' in refinery_name or 'Mexico' in refinery_name:
+                    country = 'Мексико'
+                elif 'Valcambi' in refinery_name:
+                    country = 'Швейцария'
+                elif 'Argor' in refinery_name or 'Heraeus' in refinery_name:
+                    country = 'Швейцария'
+                elif 'Pamp' in refinery_name:
+                    country = 'Швейцария'
+                elif 'Royal Mint' in refinery_name:
+                    country = 'Великобритания'
+                elif 'Perth Mint' in refinery_name:
+                    country = 'Австралия'
+                elif 'Canadian Mint' in refinery_name:
+                    country = 'Канада'
+                elif 'United States Mint' in refinery_name or 'US Mint' in refinery_name:
+                    country = 'САЩ'
+                elif 'Austrian Mint' in refinery_name or 'Münze Österreich' in refinery_name:
+                    country = 'Австрия'
+                else:
+                    # Default country if not recognized
+                    country = 'Неизвестна'
+            else:
+                # Fallback to hardcoded patterns if no structured data found
+                if 'Valcambi' in page_text:
+                    refinery_name = 'Valcambi'
+                    country = 'Швейцария'
+                elif 'Argor-Heraeus' in page_text or 'Argor Heraeus' in page_text:
+                    refinery_name = 'Argor-Heraeus'
+                    country = 'Швейцария'
+                elif 'Pamp' in page_text:
+                    refinery_name = 'Pamp'
+                    country = 'Швейцария'
+                elif 'Royal Mint' in page_text:
+                    refinery_name = 'Royal Mint'
+                    country = 'Великобритания'
+                elif 'Perth Mint' in page_text:
+                    refinery_name = 'Perth Mint'
+                    country = 'Австралия'
+                elif 'Canadian Mint' in page_text or 'Royal Canadian Mint' in page_text:
+                    refinery_name = 'Royal Canadian Mint'
+                    country = 'Канада'
+                elif 'US Mint' in page_text or 'United States Mint' in page_text:
+                    refinery_name = 'United States Mint'
+                    country = 'САЩ'
+                elif 'Austrian Mint' in page_text or 'Münze Österreich' in page_text:
+                    refinery_name = 'Austrian Mint'
+                    country = 'Австрия'
+            
+            # Set country and vendor
+            if refinery_name:
+                product_data['country'] = country
+                
+                # Get or create vendor and set vendor_id
+                vendor_id = self.get_or_create_vendor(refinery_name, country)
+                product_data['vendor_id'] = vendor_id
 
             # Extract purity
             purity_match = re.search(r'(\d{3,4}\.?\d*)\s*(?:проба|purity)', page_text, re.IGNORECASE)
@@ -306,37 +446,44 @@ class IGoldScraper:
             elif 'сребро' in page_text.lower() or 'silver' in page_text.lower():
                 product_data['purity'] = '999.0'
 
-            # Extract fine gold content
-            if product_data['weight'] and product_data['purity']:
-                try:
-                    weight_num = float(re.search(r'(\d+\.?\d*)', product_data['weight']).group(1))
-                    purity_num = float(product_data['purity'])
-                    fine_gold = weight_num * (purity_num / 1000)
-                    product_data['fine_gold'] = f"{fine_gold:.2f} гр."
-                except:
-                    pass
-
-            # Extract images
+            # Extract images - only product images
             images = soup.find_all('img')
-            image_urls = []
+            product_image_urls = []
             for img in images:
                 img_src = img.get('src', '')
                 if img_src and not img_src.startswith('http'):
                     img_src = urljoin(self.base_url, img_src)
-                if img_src and 'product' in img_src.lower():
-                    image_urls.append(img_src)
+                
+                # Only include actual product images
+                if img_src and any(product_indicator in img_src.lower() for product_indicator in [
+                    'kyulche', 'moneta', 'zlat', 'srebro', 'platina', 'paladiy', 
+                    'valcambi', 'pamp', 'argor', 'royal', 'perth', 'krugerrand',
+                    'britania', 'eagle', 'philharmonia', 'kangaroo', 'koala', 'panda'
+                ]) and not any(exclude in img_src.lower() for exclude in [
+                    'logo', 'icon', 'banner', 'header', 'footer', 'social', 'facebook', 
+                    'twitter', 'instagram', 'youtube', 'whatsapp', 'viber', 'email',
+                    'phone', 'contact', 'menu', 'nav', 'button', 'arrow', 'close',
+                    'loading', 'spinner', 'placeholder', 'default', 'no-image', 'bloomberg'
+                ]):
+                    product_image_urls.append(img_src)
+                    logger.info(f"Found product image: {img_src}")
 
-            # Separate images into two columns
-            if len(image_urls) >= 1:
-                product_data['image_url_1'] = image_urls[0]
-            if len(image_urls) >= 2:
-                product_data['image_url_2'] = image_urls[1]
+            # Store images in images list (no longer in product_data)
+            if len(product_image_urls) >= 1:
+                self.images.append({
+                    'product_id': product_data['product_id'],
+                    'image_url': product_image_urls[0],
+                    'image_order': 1
+                })
+                logger.info(f"Added product image 1 for product {product_data['product_id']}: {product_image_urls[0]}")
+            if len(product_image_urls) >= 2:
+                self.images.append({
+                    'product_id': product_data['product_id'],
+                    'image_url': product_image_urls[1],
+                    'image_order': 2
+                })
+                logger.info(f"Added product image 2 for product {product_data['product_id']}: {product_image_urls[1]}")
 
-            # Extract other properties
-            if 'Холограмна Защита' in page_text:
-                product_data['other_properties'] = 'Холограмна Защита'
-            elif 'с обков и кутия' in page_text:
-                product_data['other_properties'] = 'с обков и кутия'
 
             # Filter out non-product pages
             product_name = product_data['product_name'].lower()
@@ -380,6 +527,8 @@ class IGoldScraper:
             
                 # Only return if it's a real product
                 if is_real_product and product_data['product_name']:
+                    # Mark this URL as processed
+                    self.processed_urls.add(product_url)
                     return product_data
                 else:
                     logger.warning(f"Product filtered out - is_real_product: {is_real_product}, has_name: {bool(product_data['product_name'])}, name: '{product_data['product_name']}'")
@@ -402,8 +551,16 @@ class IGoldScraper:
             return []
 
         products = []
+        skipped_duplicates = 0
+        
         for i, product_url in enumerate(product_links):
             try:
+                # Check if we've already processed this URL
+                if product_url in self.processed_urls:
+                    skipped_duplicates += 1
+                    logger.info(f"Skipping already processed URL: {product_url}")
+                    continue
+                
                 product_data = self.scrape_individual_product(product_url, category_id, subcategory_id)
                 if product_data:
                     products.append(product_data)
@@ -418,8 +575,84 @@ class IGoldScraper:
                 logger.warning(f"Error processing product {product_url}: {e}")
                 continue
 
-        logger.info(f"Scraped {len(products)} products from {len(product_links)} product links")
+        logger.info(f"Scraped {len(products)} products from {len(product_links)} product links (skipped {skipped_duplicates} duplicates)")
         return products
+    
+    def get_or_create_vendor(self, refinery_name, country=''):
+        """Get existing vendor or create new one, return vendor_id."""
+        if not refinery_name:
+            return None
+            
+        # Check if vendor already exists
+        for vendor in self.vendors:
+            if vendor['name'].lower() == refinery_name.lower():
+                logger.info(f"Found existing vendor: {vendor['name']} (ID: {vendor['vendor_id']})")
+                return vendor['vendor_id']
+        
+        # Create new vendor
+        self.vendor_counter += 1
+        new_vendor = {
+            'vendor_id': self.vendor_counter,
+            'name': refinery_name,
+            'country': country
+        }
+        self.vendors.append(new_vendor)
+        return self.vendor_counter
+    
+    def remove_duplicate_products(self):
+        """Remove duplicate products based on slug (URL path) which is the most reliable identifier."""
+        logger.info("Removing duplicate products...")
+        
+        original_count = len(self.products)
+        seen_slugs = set()
+        unique_products = []
+        duplicate_count = 0
+        
+        for product in self.products:
+            # Use slug as the primary unique identifier since it represents the URL path
+            product_slug = product.get('slug', '').strip()
+            
+            if product_slug and product_slug not in seen_slugs:
+                seen_slugs.add(product_slug)
+                unique_products.append(product)
+            elif product_slug:
+                duplicate_count += 1
+                logger.info(f"Removing duplicate product by slug: {product.get('product_name', 'Unknown')} - {product_slug}")
+            else:
+                # If no slug, fallback to name + weight combination
+                product_key = (
+                    product.get('product_name', '').lower().strip(),
+                    product.get('weight', '').strip()
+                )
+                
+                if product_key not in seen_slugs:
+                    seen_slugs.add(product_key)
+                    unique_products.append(product)
+                else:
+                    duplicate_count += 1
+                    logger.info(f"Removing duplicate product by name+weight: {product.get('product_name', 'Unknown')} - {product.get('weight', 'Unknown')}")
+        
+        self.products = unique_products
+        logger.info(f"Removed {duplicate_count} duplicate products. Original: {original_count}, Unique: {len(self.products)}")
+        
+        # Also clean up images for removed products
+        if duplicate_count > 0:
+            self.cleanup_orphaned_images()
+    
+    def cleanup_orphaned_images(self):
+        """Remove images that belong to products that were removed as duplicates."""
+        logger.info("Cleaning up orphaned images...")
+        
+        # Get all valid product IDs
+        valid_product_ids = {product['product_id'] for product in self.products}
+        
+        # Filter images to keep only those with valid product IDs
+        original_image_count = len(self.images)
+        self.images = [img for img in self.images if img['product_id'] in valid_product_ids]
+        
+        removed_images = original_image_count - len(self.images)
+        if removed_images > 0:
+            logger.info(f"Removed {removed_images} orphaned images. Original: {original_image_count}, Remaining: {len(self.images)}")
     
     def is_valid_product_block(self, block):
         """Check if a block is a valid product block and not some other element."""
@@ -489,7 +722,6 @@ class IGoldScraper:
                 'image_url_1': '',
                 'image_url_2': '',
                 'country': '',
-                'refinery': '',
                 'weight': '',
                 'purity': '',
                 'fine_gold': '',
@@ -593,24 +825,21 @@ class IGoldScraper:
             if weight_match:
                 product_data['weight'] = weight_match.group(1) + ' гр.'
             
-            # Extract prices (buy and sell)
+            # Extract prices (buy and sell) - only numeric values, no "лв."
             price_matches = re.findall(r'(\d+\.?\d*)\s*лв', block_text)
             if len(price_matches) >= 2:
                 # Usually the first price is buy price, second is sell price
-                product_data['buy_price'] = price_matches[0] + ' лв.'
-                product_data['sell_price'] = price_matches[1] + ' лв.'
+                product_data['buy_price'] = price_matches[0]
+                product_data['sell_price'] = price_matches[1]
             elif len(price_matches) == 1:
-                product_data['buy_price'] = price_matches[0] + ' лв.'
+                product_data['buy_price'] = price_matches[0]
             
-            # Extract country/refinery information
+            # Extract country information
             if 'Valcambi' in block_text:
-                product_data['refinery'] = 'Valcambi'
                 product_data['country'] = 'Швейцария'
             elif 'Argor-Heraeus' in block_text or 'Argor Heraeus' in block_text:
-                product_data['refinery'] = 'Argor-Heraeus'
                 product_data['country'] = 'Швейцария'
             elif 'Pamp' in block_text:
-                product_data['refinery'] = 'Pamp'
                 product_data['country'] = 'Швейцария'
             
             # Extract purity (usually 999.9 or similar for gold)
@@ -679,7 +908,6 @@ class IGoldScraper:
                 'product_name': '',
                 'image_url': '',
                 'country': '',
-                'refinery': '',
                 'weight': '',
                 'purity': '',
                 'fine_gold': '',
@@ -790,6 +1018,20 @@ class IGoldScraper:
                     df_products = pd.DataFrame(self.products)
                     df_products.to_excel(writer, sheet_name='Products', index=False)
                     logger.info(f"Saved {len(self.products)} products")
+                
+                # Images sheet
+                if self.images:
+                    df_images = pd.DataFrame(self.images)
+                    df_images.to_excel(writer, sheet_name='Images', index=False)
+                    logger.info(f"Saved {len(self.images)} images")
+                
+                # Vendors sheet
+                if self.vendors:
+                    df_vendors = pd.DataFrame(self.vendors)
+                    df_vendors.to_excel(writer, sheet_name='Vendors', index=False)
+                    logger.info(f"Saved {len(self.vendors)} vendors")
+                
+                
             
             logger.info(f"Data successfully saved to {filename}")
             return True
@@ -798,9 +1040,12 @@ class IGoldScraper:
             logger.error(f"Error saving to Excel: {e}")
             return False
     
-    def run(self):
+    def run(self, test_mode=False, test_category_id=None):
         """Main function to run the complete scraping process."""
-        logger.info("Starting iGold.bg scraper...")
+        if test_mode:
+            logger.info(f"Starting iGold.bg scraper in TEST MODE for category {test_category_id}...")
+        else:
+            logger.info("Starting iGold.bg scraper...")
         
         try:
             # Step 1: Get categories
@@ -808,6 +1053,11 @@ class IGoldScraper:
             if not categories:
                 logger.error("No categories found. Exiting.")
                 return False
+            
+            # In test mode, filter categories
+            if test_mode and test_category_id:
+                categories = [cat for cat in categories if str(cat['id']) == str(test_category_id)]
+                logger.info(f"Test mode: Filtered to {len(categories)} categories")
             
             # Step 2: Get subcategories for each category
             for category in categories:
@@ -855,14 +1105,23 @@ class IGoldScraper:
                 # Throttling between categories
                 time.sleep(2)
             
-            # Step 4: Save to Excel
-            success = self.save_to_excel()
+            # Step 4: Remove duplicate products
+            self.remove_duplicate_products()
+            
+            # Step 5: Save to Excel
+            filename = 'igold_data_test.xlsx' if test_mode else 'igold_data.xlsx'
+            success = self.save_to_excel(filename)
             
             if success:
-                logger.info("Scraping completed successfully!")
+                if test_mode:
+                    logger.info("TEST MODE scraping completed successfully!")
+                else:
+                    logger.info("Scraping completed successfully!")
                 logger.info(f"Total categories: {len(self.categories)}")
                 logger.info(f"Total subcategories: {len(self.subcategories)}")
                 logger.info(f"Total products: {len(self.products)}")
+                logger.info(f"Total images: {len(self.images)}")
+                logger.info(f"Total vendors: {len(self.vendors)}")
                 return True
             else:
                 logger.error("Failed to save data to Excel")
@@ -874,14 +1133,29 @@ class IGoldScraper:
 
 def main():
     """Main function to run the scraper."""
-    scraper = IGoldScraper()
-    success = scraper.run()
+    import sys
     
-    if success:
-        print("\n✅ Scraping completed successfully!")
-        print("📊 Data saved to igold_data.xlsx")
+    # Check for test mode argument
+    test_mode = len(sys.argv) > 1 and sys.argv[1] == '--test'
+    test_category_id = '2'  # Silver category ID
+    
+    scraper = IGoldScraper()
+    
+    if test_mode:
+        print("🧪 Running in TEST MODE - Silver only")
+        success = scraper.run(test_mode=True, test_category_id=test_category_id)
+        if success:
+            print("\n✅ TEST MODE scraping completed successfully!")
+            print("📊 Data saved to igold_data_test.xlsx")
+        else:
+            print("\n❌ TEST MODE scraping failed. Check the logs for details.")
     else:
-        print("\n❌ Scraping failed. Check the logs for details.")
+        success = scraper.run()
+        if success:
+            print("\n✅ Scraping completed successfully!")
+            print("📊 Data saved to igold_data.xlsx")
+        else:
+            print("\n❌ Scraping failed. Check the logs for details.")
 
 if __name__ == "__main__":
     main()
